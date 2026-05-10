@@ -38,7 +38,9 @@ import asyncio
 import json
 import logging
 import os
+import ssl
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -61,6 +63,7 @@ logger = logging.getLogger(__name__)
 
 ENV_BASE_URL = "DIFY_BASE_URL"
 ENV_API_KEY = "DIFY_API_KEY"
+ENV_CA_BUNDLE = "DIFY_CA_BUNDLE"
 
 
 # =============================================================================
@@ -298,6 +301,7 @@ class DifyClient:
 
     base_url: str | None = None         # 例: "https://dify.example.com"
     api_key: str | None = None          # 例: "app-xxxxx"
+    ca_bundle: str | Path | None = None  # SSL CAバンドル/証明書のパス。Noneなら環境変数を見る
     timeout_seconds: int = 120          # 1リクエストのタイムアウト
     max_retries: int = 3                # リトライ回数
     user_identifier: str = "python_client"  # Difyログに残るユーザ識別子
@@ -308,6 +312,11 @@ class DifyClient:
             self.base_url = os.environ.get(ENV_BASE_URL)
         if self.api_key is None:
             self.api_key = os.environ.get(ENV_API_KEY)
+        if self.ca_bundle is None:
+            env_ca = os.environ.get(ENV_CA_BUNDLE)
+            # 空文字列は未指定扱い
+            if env_ca:
+                self.ca_bundle = env_ca
 
         if not self.base_url:
             raise DifyClientError(
@@ -323,6 +332,30 @@ class DifyClient:
         # 末尾スラッシュを除去
         self.base_url = self.base_url.rstrip("/")
 
+        # SSL設定の解決
+        # - ca_bundle が None        → デフォルト検証 (verify=True)
+        # - ca_bundle にパス指定あり → そのファイルを使用 (存在チェックする)
+        if self.ca_bundle is None:
+            self._verify: bool | str = True
+            self._ssl_context: ssl.SSLContext | None = None
+        else:
+            ca_path = Path(self.ca_bundle)
+            if not ca_path.exists():
+                raise DifyClientError(
+                    f"CA bundle ファイルが見つかりません: {ca_path}\n"
+                    f"引数 ca_bundle または環境変数 {ENV_CA_BUNDLE} のパスを確認してください。"
+                )
+            if not ca_path.is_file():
+                raise DifyClientError(
+                    f"CA bundle のパスがファイルではありません: {ca_path}"
+                )
+            ca_path_str = str(ca_path)
+            # 同期側 (requests) はパス文字列を verify に渡す
+            self._verify = ca_path_str
+            # 非同期側 (aiohttp) は SSLContext を作って TCPConnector に渡す
+            self._ssl_context = ssl.create_default_context(cafile=ca_path_str)
+            logger.info(f"Using custom CA bundle: {ca_path_str}")
+
     # =========================================================================
     # 共通: HTTPヘッダ
     # =========================================================================
@@ -332,6 +365,22 @@ class DifyClient:
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _build_connector(self) -> aiohttp.TCPConnector | None:
+        """
+        非同期APIで使うTCPConnectorを生成。
+
+        カスタムCA bundle が指定されている場合は SSLContext を持つ
+        TCPConnector を返す。指定がない場合は None を返す（aiohttp の
+        デフォルト挙動: certifi のCAバンドルで検証）。
+
+        Note:
+            ClientSession に渡すコネクタは Session ごとに新規作成する必要が
+            ある（コネクタは Session のライフサイクルに紐づくため）。
+        """
+        if self._ssl_context is None:
+            return None
+        return aiohttp.TCPConnector(ssl=self._ssl_context)
 
     @property
     def workflow_run_url(self) -> str:
@@ -384,6 +433,7 @@ class DifyClient:
                 headers=self._headers(),
                 json=payload,
                 timeout=self.timeout_seconds,
+                verify=self._verify,
             )
         except requests.exceptions.Timeout as e:
             raise DifyTimeoutError(f"タイムアウト: {e}") from e
@@ -497,7 +547,7 @@ class DifyClient:
         """1回の非同期呼び出し（リトライなし）。"""
         own_session = session is None
         if own_session:
-            session = aiohttp.ClientSession()
+            session = aiohttp.ClientSession(connector=self._build_connector())
 
         try:
             timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
@@ -553,7 +603,7 @@ class DifyClient:
 
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(connector=self._build_connector()) as session:
             async def run_one(idx: int, batch: list[dict]) -> BatchResult:
                 async with semaphore:
                     logger.info(
