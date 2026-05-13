@@ -270,6 +270,26 @@ class CodeBook(BaseModel):
             )
         return self.product_categories[pt].failure_categories
 
+    def get_failure_category(
+        self, code: str, product_type: str | ProductType
+    ) -> FailureCategory | None:
+        """
+        指定故障コードの FailureCategory オブジェクトを返す。
+
+        derive_metrics.py で name や record_type を取り出す用途を想定。
+        コードが体系外なら None を返す（厳格にしない、is_valid_failure_code と
+        組み合わせて使うことを想定）。
+
+        Args:
+            code: 故障コード（例: "M012"）
+            product_type: "ML" または "LENS"
+
+        Returns:
+            FailureCategory オブジェクト、または存在しない場合は None
+        """
+        codes = self.get_failure_codes_for_product(product_type)
+        return codes.get(code)
+
     def is_valid_failure_code(
         self, code: str, product_type: str | ProductType
     ) -> bool:
